@@ -17,6 +17,22 @@ WELCOME_MESSAGE = os.environ.get(
     "Du bist Member #PLACE und wir freuen uns riesig, dass du jetzt dabei bist"
 )
 
+# ================================================================
+#  Web health (Render) — bind a port so Render doesn't kill the app
+# ================================================================
+from fastapi import FastAPI
+import uvicorn
+
+api = FastAPI()
+
+@api.get("/")
+async def root():
+    return {"ok": True}
+
+@api.get("/health")
+async def health():
+    return {"ok": True}
+
 # -------------------
 # CODE (do not edit)
 # -------------------
@@ -27,12 +43,19 @@ from typing import Optional, Tuple, Iterable
 import aiohttp
 import discord
 from discord.ext import commands
-from PIL import Image, ImageOps, ImageDraw, ImageStat
 
+# Pillow imports + resampling compatibility (Pillow 9/10/11)
+try:
+    from PIL import Image, ImageOps, ImageDraw, ImageStat
+    from PIL.Image import Resampling as _Resampling
+    RESAMPLE_LANCZOS = _Resampling.LANCZOS
+except Exception:  # older Pillow
+    from PIL import Image, ImageOps, ImageDraw, ImageStat
+    RESAMPLE_LANCZOS = Image.LANCZOS
 
 # ---------- bot + intents ----------
 intents = discord.Intents.default()
-intents.members = True  # required for on_member_join
+intents.members = True  # required for on_member_join (also enable in Dev Portal)
 intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -47,11 +70,10 @@ async def ensure_http():
     if _http is None or _http.closed:
         _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
 
-
 async def fetch_bytes(url: str) -> Optional[bytes]:
     await ensure_http()
     try:
-        async with _http.get(url, headers={"User-Agent": "gvw-welcome/1.1"}) as r:
+        async with _http.get(url, headers={"User-Agent": "gvw-welcome/1.2"}) as r:
             if r.status != 200:
                 print(f"[http] {url} -> status {r.status}")
                 return None
@@ -104,11 +126,10 @@ def _auto_detect_circle_bbox(bg: Image.Image) -> Optional[Tuple[int, int, int]]:
     if bg.width > max_w:
         scale = bg.width / max_w
         new_h = int(round(bg.height / scale))
-        small = bg.resize((max_w, new_h), Image.LANCZOS)
+        small = bg.resize((max_w, new_h), RESAMPLE_LANCZOS)
 
     # Convert to grayscale, threshold on bright
     gray = small.convert("L")
-    # Auto-threshold-ish: compute overall brightness and pick a high cutoff
     mean = ImageStat.Stat(gray).mean[0]
     cutoff = min(255, max(200, int(mean + 40)))  # push into bright range
     mask = gray.point(lambda p: 255 if p >= cutoff else 0, mode="1")
@@ -141,7 +162,6 @@ def _auto_detect_circle_bbox(bg: Image.Image) -> Optional[Tuple[int, int, int]]:
                     if (nx, ny) not in visited and pix[nx, ny] == 255:
                         visited.add((nx, ny))
                         stack.append((nx, ny))
-            # track largest bright blob
             if area > best_area:
                 best_area = area
                 best_bbox = (minx, miny, maxx, maxy)
@@ -211,7 +231,7 @@ def compose_card(bg: Image.Image, avatar_bytes: Optional[bytes]) -> bytes:
     else:
         avatar = Image.new("RGBA", size, (200, 200, 200, 255))
 
-    avatar = ImageOps.fit(avatar, size, method=Image.LANCZOS)
+    avatar = ImageOps.fit(avatar, size, method=RESAMPLE_LANCZOS)
 
     # Circle mask (anti-aliased)
     mask = Image.new("L", size, 0)
@@ -265,11 +285,10 @@ async def on_ready():
 @bot.event
 async def on_member_join(member: discord.Member):
     # resolve channel
-    channel: Optional[discord.abc.Messageable] = None
     g = member.guild
     if not g:
         return
-    channel = g.get_channel(WELCOME_CHANNEL_ID)
+    channel: Optional[discord.abc.Messageable] = g.get_channel(WELCOME_CHANNEL_ID)
     if channel is None:
         try:
             channel = await bot.fetch_channel(WELCOME_CHANNEL_ID)
@@ -306,8 +325,7 @@ async def on_member_join(member: discord.Member):
 
 
 # ---------- graceful shutdown ----------
-@bot.event
-async def on_disconnect():
+async def _graceful_close():
     global _http
     try:
         if _http and not _http.closed:
@@ -315,9 +333,32 @@ async def on_disconnect():
     except Exception:
         pass
 
+@bot.event
+async def on_disconnect():
+    # Discord may reconnect; avoid closing session here to keep it available.
+    pass
 
-# ---------- main ----------
+
+# ---------- run both: uvicorn (web) + discord bot ----------
+async def _run_web():
+    port = int(os.environ.get("PORT", "8000"))
+    config = uvicorn.Config(api, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+async def main():
+    try:
+        await asyncio.gather(
+            _run_web(),
+            bot.start(DISCORD_TOKEN),
+        )
+    finally:
+        await _graceful_close()
+
 if __name__ == "__main__":
-    if not DISCORD_TOKEN or DISCORD_TOKEN == "PUT_YOUR_DISCORD_TOKEN_HERE":
-        raise SystemExit("Please set DISCORD_TOKEN at the top of the file.")
-    bot.run(DISCORD_TOKEN)
+    if not DISCORD_TOKEN:
+        raise SystemExit("Please set DISCORD_TOKEN in the environment.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
